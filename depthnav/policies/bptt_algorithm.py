@@ -58,6 +58,8 @@ class BPTT:
         assert len(self.eval_envs) == len(self.eval_csvs)
         self.device = th.device(device)
         self.policy = policy.to(self.device)
+        if hasattr(self.policy, "device"):
+            self.policy.device = self.device
 
         # training parameters
         self.iterations = iterations
