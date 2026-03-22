@@ -112,12 +112,12 @@ class MultiInputPolicy(MlpPolicy):
             device,
         )
 
-        self.feature_extractor = feature_extractor
-        self.feature_norm = feature_norm
+        self.feature_extractor = feature_extractor.to(device)
+        self.feature_norm = feature_norm.to(device)
         if _is_recurrent:
             self._is_recurrent = True
             self._latent_dim = in_dim
-            self.recurrent_extractor = recurrent_extractor
+            self.recurrent_extractor = recurrent_extractor.to(device)
 
         self.enable_geodesic_aux = (
             net_arch.get("enable_geodesic_aux", True)
@@ -130,6 +130,8 @@ class MultiInputPolicy(MlpPolicy):
                 aux_activation_fn(),
                 nn.Linear(aux_hidden_dim, 3),
             ).to(device)
+
+        self.to(device)
 
     def forward(self, obs, latent=None, return_aux=False):
         features = self.feature_extractor(obs)
