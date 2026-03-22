@@ -13,6 +13,7 @@ from copy import deepcopy
 from depthnav.common import std_to_habitat
 from depthnav.utils.type import Uniform, Normal
 from depthnav.utils.rotation3 import Rotation3
+from depthnav.utils.paths import resolve_depthnav_dataset_path, get_depthnav_dataset_path
 
 empty_scene = {
     "stage_instance": {
@@ -46,13 +47,14 @@ class BoxGenerator:
         self,
         low=[0.0, 0.0, 0.0],
         high=[1.0, 1.0, 1.0],
-        dataset_path="./datasets/depthnav_dataset",
+        dataset_path=None,
         object_set="primitives/medium",
         density=0.2,
         scale_rng=Uniform([1.0], [0.0]),
         rotation_rng=Uniform([0.0, 0.0, 0.0], [3.0, 3.0, 3.0]),
         seed=None,
     ):
+        dataset_path = resolve_depthnav_dataset_path(dataset_path, require_exists=True)
         self.low = th.tensor(low)
         self.high = th.tensor(high)
         self.object_set = os.path.join(dataset_path, f"configs/{object_set}")
@@ -109,13 +111,14 @@ class CylinderGenerator:
         base_center=[0.0, 0.0, 0.0],
         radius=3.0,
         height=10.0,
-        dataset_path="./datasets/depthnav_dataset",
+        dataset_path=None,
         object_set="primitives/medium",
         density=0.2,
         scale_rng=Uniform([1.0], [0.0]),
         rotation_rng=Uniform([0.0, 0.0, 0.0], [3.0, 3.0, 3.0]),
         seed=None,
     ):
+        dataset_path = resolve_depthnav_dataset_path(dataset_path, require_exists=True)
         self.base_center = th.tensor(base_center)
         self.radius = radius
         self.height = height
@@ -186,14 +189,14 @@ class CylinderGenerator:
 class SceneGenerator:
     def __init__(
         self,
-        dataset_path: str,
         num: int,
         name: str,
         stage: str,
+        dataset_path: str = None,
         keep_in_bounds: Union[List, BoxGenerator] = BoxGenerator(),
         keep_out_bounds: Union[List, BoxGenerator] = [],
     ) -> None:
-        self.dataset_path = dataset_path
+        self.dataset_path = resolve_depthnav_dataset_path(dataset_path, require_exists=True)
         self.num = num
         self.name = name
         self.stage = stage
@@ -203,7 +206,7 @@ class SceneGenerator:
         self.summary_path = str(
             list(Path(self.dataset_path).glob("*.scene_dataset_config.json"))[0]
         )
-        self.save_path = os.path.join(dataset_path, f"configs/{name}")
+        self.save_path = os.path.join(self.dataset_path, f"configs/{name}")
 
         self._write_scene_dir_in_summary(name)
 
@@ -302,7 +305,7 @@ def parsers():
 
 if __name__ == "__main__":
     args = parsers().parse_args()
-    dataset_path = "./datasets/depthnav_dataset"
+    dataset_path = get_depthnav_dataset_path(require_exists=True)
     g = SceneGenerator(
         dataset_path=dataset_path,
         num=args.quantity,

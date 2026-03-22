@@ -15,6 +15,7 @@ from depthnav.policies.policy_aliases import policy_aliases
 from depthnav.policies.multi_input_policy import MultiInputPolicy
 from depthnav.common import ExitCode
 from depthnav.scripts.eval_logger import Evaluate
+from depthnav.utils.paths import get_depthnav_agent_object_path
 
 
 def main(args):
@@ -39,7 +40,7 @@ def main(args):
                     "resolution": [512, 512],
                     "axes": True,
                     "trajectory": False,
-                    "object_path": "./datasets/depthnav_dataset/configs/agents/DJI_Mavic_Mini_2.object_config.json",
+                    "object_path": get_depthnav_agent_object_path(require_exists=True),
                     "line_width": 2.0,
                 }
 

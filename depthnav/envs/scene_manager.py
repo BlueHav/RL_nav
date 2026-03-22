@@ -23,6 +23,10 @@ import itertools
 from ..common import std_to_habitat, habitat_to_std
 from ..utils.type import Uniform, Normal
 from ..utils.rotation3 import Rotation3
+from ..utils.paths import (
+    get_depthnav_dataset_subpath,
+    resolve_depthnav_dataset_path,
+)
 from .dataloader import SimpleDataLoader, ChildrenPathDataset
 
 import skfmm
@@ -76,13 +80,16 @@ class Bounds:
 class UniformObstacleGenerator:
     def __init__(
         self,
-        obstacle_sets=["./datasets/depthnav_dataset/configs/objects"],
+        obstacle_sets=None,
         set_densities=[0.1],
         seed=None,
         random_kwargs=None,
         num_template_rescales_per_scene=0,
         obstacle_bounds: Optional[Union[Bounds, Dict]] = None,
     ):
+        obstacle_sets = obstacle_sets or [
+            get_depthnav_dataset_subpath("configs", "objects", require_exists=False)
+        ]
         assert len(obstacle_sets) == len(set_densities)
         self._obstacle_sets = [
             self._get_all_children_path(obstacle_set) for obstacle_set in obstacle_sets
@@ -328,7 +335,7 @@ class SceneManager:
     def __init__(
         self,
         path: str,
-        dataset_path: str = "./datasets/depthnav_dataset",
+        dataset_path: Optional[str] = None,
         spawn_obstacles: bool = False,
         obstacle_generator_class: str = "uniform",
         obstacle_generator_kwargs=None,
@@ -350,7 +357,9 @@ class SceneManager:
         if sensor_settings is None:
             raise ValueError("No sensor settings provided")
 
-        self.dataset_path = os.path.abspath(dataset_path)
+        self.dataset_path = resolve_depthnav_dataset_path(
+            dataset_path, require_exists=True
+        )
         self._scene_dataset_config_path = [
             os.path.join(self.dataset_path, file)
             for file in os.listdir(self.dataset_path)

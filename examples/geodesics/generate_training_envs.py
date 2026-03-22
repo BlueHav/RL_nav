@@ -9,8 +9,9 @@ from depthnav.envs.scene_generator import (
 )
 from depthnav.utils.type import Uniform, Normal, Cylinder
 from depthnav.envs.navigation_env import NavigationEnv
+from depthnav.utils.paths import get_depthnav_dataset_path
 
-DATASET_PATH = "./datasets/depthnav_dataset"
+DATASET_PATH = get_depthnav_dataset_path(require_exists=True)
 GRID_RESOLUTION = 0.1
 NUM_TRAIN = 25
 NUM_EVAL = 5

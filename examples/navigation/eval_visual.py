@@ -19,6 +19,7 @@ from depthnav.policies.policy_aliases import policy_aliases
 from depthnav.policies.multi_input_policy import MultiInputPolicy
 from depthnav.common import observation_to_device
 from depthnav.common import std_to_habitat, obs_list2array, rgba2rgb
+from depthnav.utils.paths import get_depthnav_agent_object_path
 
 
 def main(args):
@@ -48,7 +49,7 @@ def main(args):
         "resolution": [args.res, args.res],
         "axes": True,
         "trajectory": False,
-        "object_path": "./datasets/depthnav_dataset/configs/agents/DJI_Mavic_Mini_2.object_config.json",
+        "object_path": get_depthnav_agent_object_path(require_exists=True),
         "line_width": 2.0,
     }
     env_class = env_aliases[config["env_class"]]

@@ -90,10 +90,24 @@ Provides utility functions for:
     pip install -e .
     ```
 
+## Dataset Path
+By default, the code now looks for datasets in this order:
+
+1. `DEPTHNAV_DATASET_PATH`
+2. `DEPTHNAV_DATASETS_ROOT/depthnav_dataset`
+3. `/root/gpufree-data/datasets/depthnav_dataset`
+4. `./datasets/depthnav_dataset` inside the repository
+
+On a server where datasets were moved to `/root/gpufree-data/datasets`, you can optionally make the path explicit:
+
+```bash
+export DEPTHNAV_DATASETS_ROOT=/root/gpufree-data/datasets
+```
+
 ## Usage
 Download dataset:
 ```bash
-cd datasets/
+cd /root/gpufree-data/datasets
 ./get_dataset.sh
 ```
 

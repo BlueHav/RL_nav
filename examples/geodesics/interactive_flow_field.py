@@ -19,6 +19,7 @@ from habitat_sim.utils.settings import default_sim_settings
 from depthnav.scripts.scene_viewer import HabitatSimInteractiveViewer
 from depthnav.common import habitat_to_std, std_to_habitat
 from depthnav.envs.env_aliases import env_aliases
+from depthnav.utils.paths import get_depthnav_scene_dataset_config_path
 
 
 opacity = 1.0
@@ -119,10 +120,10 @@ def parse_args():
     )
     parser.add_argument(
         "--dataset",
-        default="./datasets/depthnav_dataset/depthnav_dataset.scene_dataset_config.json",
+        default=get_depthnav_scene_dataset_config_path(require_exists=True),
         type=str,
         metavar="DATASET",
-        help='dataset configuration file to use (default: "./datasets/depthnav_dataset/depthnav_dataset.scene_dataset_config.json")',
+        help="dataset configuration file to use",
     )
     parser.add_argument(
         "--width",
