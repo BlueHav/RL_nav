@@ -562,6 +562,37 @@ class BaseEnv:
             gradient = th.stack(gradients, dim=0)
         return gradient
 
+    def geodesic_valid(self, positions):
+        if self.single_env:
+            return self.scene_manager.geodesic_in_bounds(0, positions)
+
+        valid = []
+        for scene_id, position in enumerate(positions):
+            is_valid = self.scene_manager.geodesic_in_bounds(
+                scene_id, position.unsqueeze(0)
+            )
+            valid.append(is_valid[0])
+        return th.stack(valid, dim=0)
+
+    def geodesic_gradient_masked(self, positions, valid_mask=None):
+        valid_mask = self.geodesic_valid(positions) if valid_mask is None else valid_mask
+        gradients = th.zeros_like(positions)
+
+        if self.single_env:
+            if valid_mask.any():
+                gradients[valid_mask] = self.scene_manager.interpolate_geodesic(
+                    0, positions[valid_mask]
+                )
+            return gradients
+
+        for scene_id, (position, is_valid) in enumerate(zip(positions, valid_mask)):
+            if bool(is_valid):
+                gradient = self.scene_manager.interpolate_geodesic(
+                    scene_id, position.unsqueeze(0)
+                )
+                gradients[scene_id] = gradient[0]
+        return gradients
+
     @property
     def t(self):
         return self.dynamics.t

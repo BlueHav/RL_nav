@@ -125,6 +125,9 @@ class NavigationEnv(BaseEnv):
             self.observation_space.spaces["geodesic"] = spaces.Box(
                 low=-1.0, high=1.0, shape=(3,), dtype=np.float32
             )
+            self.observation_space.spaces["geodesic_valid"] = spaces.Box(
+                low=0.0, high=1.0, shape=(1,), dtype=np.float32
+            )
 
         # deprecated - action_space might not be correct as it depends on
         # the policy and we don't use this
@@ -336,9 +339,13 @@ class NavigationEnv(BaseEnv):
 
         if self.use_geodesic_feature:
             with th.no_grad():
-                geodesic_gradient = self.geodesic_gradient(self.position)
+                geodesic_valid = self.geodesic_valid(self.position)
+                geodesic_gradient = self.geodesic_gradient_masked(
+                    self.position, geodesic_valid
+                )
                 geodesic_gradient = F.normalize(geodesic_gradient, dim=1, eps=1e-6)
             obs["geodesic"] = geodesic_gradient.to(self.device)
+            obs["geodesic_valid"] = geodesic_valid.unsqueeze(1).float().to(self.device)
 
         return obs
 
@@ -361,15 +368,21 @@ class NavigationEnv(BaseEnv):
         safe_view_degrees = self.reward_kwargs.get("safe_view_degrees", 10.0)
         vel_thresh_slerp_yaw = self.reward_kwargs.get("vel_thresh_slerp_yaw", 1.0)
 
+        fallback_direction = F.normalize(self.target_direction, dim=1, eps=1e-6)
         if self.scene_manager.load_geodesics:
             # only compute geodesic loss if geodesics are loaded
             with th.no_grad():
-                geodesic_gradient = self.geodesic_gradient(self.position)
+                geodesic_valid = self.geodesic_valid(self.position)
+                geodesic_gradient = self.geodesic_gradient_masked(
+                    self.position, geodesic_valid
+                )
                 geodesic_gradient = F.normalize(geodesic_gradient, dim=1, eps=1e-6)
             # loss_grad = -th.sum(F.normalize(geodesic_gradient) * F.normalize(self.velocity), dim=1)
-            desired_direction_vector = geodesic_gradient
+            desired_direction_vector = th.where(
+                geodesic_valid.unsqueeze(1), geodesic_gradient, fallback_direction
+            )
         else:
-            desired_direction_vector = F.normalize(self.target_direction, dim=1, eps=1e-6)
+            desired_direction_vector = fallback_direction
             # loss_grad = th.zeros(self.num_envs)
 
         # collision loss

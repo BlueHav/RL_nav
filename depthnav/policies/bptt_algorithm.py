@@ -151,6 +151,9 @@ class BPTT:
                 geodesic_aux_loss = th.zeros(
                     self.env.num_envs, dtype=th.float32, device=self.device
                 )
+                geodesic_aux_weight = th.zeros(
+                    self.env.num_envs, dtype=th.float32, device=self.device
+                )
                 fps_start = time.time_ns()
                 discount_factor = th.ones(
                     self.env.num_envs, dtype=th.float32, device=self.device
@@ -184,14 +187,19 @@ class BPTT:
                         teacher_direction = F.normalize(
                             obs["geodesic"].detach(), dim=1, eps=1e-6
                         )
-                        geodesic_aux_loss = geodesic_aux_loss + (
-                            1.0
-                            - F.cosine_similarity(
-                                aux_outputs["geodesic_direction"],
-                                teacher_direction,
-                                dim=1,
-                            )
+                        aux_loss_step = 1.0 - F.cosine_similarity(
+                            aux_outputs["geodesic_direction"],
+                            teacher_direction,
+                            dim=1,
                         )
+                        if "geodesic_valid" in obs:
+                            valid_mask = obs["geodesic_valid"].detach().view(-1) > 0.5
+                            valid_mask_f = valid_mask.float()
+                        else:
+                            valid_mask = th.ones_like(aux_loss_step, dtype=th.bool)
+                            valid_mask_f = th.ones_like(aux_loss_step)
+                        geodesic_aux_loss = geodesic_aux_loss + aux_loss_step * valid_mask_f
+                        geodesic_aux_weight = geodesic_aux_weight + valid_mask_f
 
                     # step
                     obs, reward, done, info = self.env.step(actions, is_test=False)
@@ -212,9 +220,17 @@ class BPTT:
 
                 # backprop
                 loss = loss / self.horizon  # average across the rollout
-                geodesic_aux_loss = geodesic_aux_loss / self.horizon
                 reward_loss = loss.mean()  # average across the batch
-                geodesic_aux_loss_mean = geodesic_aux_loss.mean()
+                valid_geo_mask = geodesic_aux_weight > 0
+                geodesic_aux_loss = th.where(
+                    valid_geo_mask,
+                    geodesic_aux_loss / geodesic_aux_weight.clamp(min=1.0),
+                    th.zeros_like(geodesic_aux_loss),
+                )
+                if valid_geo_mask.any():
+                    geodesic_aux_loss_mean = geodesic_aux_loss[valid_geo_mask].mean()
+                else:
+                    geodesic_aux_loss_mean = th.zeros((), device=self.device)
                 loss = reward_loss + self.lambda_geo_aux * geodesic_aux_loss_mean
                 self.optimizer.zero_grad()
                 loss.backward()

@@ -384,6 +384,10 @@ class SceneManager:
         self.drone_radius = uav_radius
         self.sensitive_radius = sensitive_radius
         self.spawn_obstacles = spawn_obstacles
+        self._geodesic_oob_warning_count = 0
+        self._geodesic_oob_log_every = int(
+            os.environ.get("DEPTHNAV_GEODESIC_OOB_LOG_EVERY", "100")
+        )
         if spawn_obstacles:
             generator_class = self.obstacle_generator_aliases[obstacle_generator_class]
             self.obstacle_generator = generator_class(**obstacle_generator_kwargs)
@@ -1394,6 +1398,11 @@ class SceneManager:
         c = c0 * (1 - dz) + c1 * dz
         return c
 
+    def geodesic_in_bounds(self, scene_id, pts):
+        geodesic = self.geodesics[scene_id]
+        bb_std = geodesic["bb_std"]
+        return ((pts >= bb_std[0]) & (pts <= bb_std[1])).all(dim=1)
+
     def interpolate_geodesic(self, scene_id, pts, gradient=True):
         geodesic = self.geodesics[scene_id]
         grid_resolution = geodesic["grid_resolution"]
@@ -1403,13 +1412,30 @@ class SceneManager:
         else:
             grid = geodesic["costs"].unsqueeze(-1)
 
-        # Print out-of-bounds coords
-        below_min = pts < bb_std[0]  # shape (N, 3)
+        # summarize out-of-bounds geodesic queries without spamming stdout
+        below_min = pts < bb_std[0]
         above_max = pts > bb_std[1]
-        out_of_bounds = below_min | above_max  # shape (N, 3)
-        for i in range(pts.shape[0]):
-            if out_of_bounds[i].any():
-                print(f"Coord {i}: {pts[i].tolist()} is out of bounds")
+        out_of_bounds = below_min | above_max
+        oob_mask = out_of_bounds.any(dim=1)
+        num_oob = int(oob_mask.sum().item())
+        if num_oob > 0 and self._geodesic_oob_log_every != 0:
+            self._geodesic_oob_warning_count += 1
+            should_log = (
+                self._geodesic_oob_warning_count == 1
+                or self._geodesic_oob_warning_count % self._geodesic_oob_log_every == 0
+            )
+            if should_log:
+                example_idx = int(oob_mask.nonzero(as_tuple=True)[0][0].item())
+                example_coord = pts[example_idx].tolist()
+                colorlog.log.warning(
+                    "Clamping %d out-of-bounds geodesic query point(s) in scene %d "
+                    "(warning %d, log_every=%d). Example: %s",
+                    num_oob,
+                    scene_id,
+                    self._geodesic_oob_warning_count,
+                    self._geodesic_oob_log_every,
+                    example_coord,
+                )
 
         # clamp query coords to bounds
         pts = pts.clamp(min=bb_std[0], max=bb_std[1])
