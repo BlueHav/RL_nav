@@ -38,7 +38,6 @@ def main(args):
     eval_config = deepcopy(config["env"])
     eval_config["num_envs"] = args.num_envs
     eval_config["single_env"] = False
-    eval_config["scene_kwargs"]["load_geodesics"] = False
 
     render_kwargs = {}
 
@@ -76,6 +75,8 @@ def main(args):
 
     if args.save_name is None:
         save_name = create_name(args.weight.split(".")[0] + "_eval")
+    else:
+        save_name = args.save_name
 
     evaluate = Evaluate(
         env=env,
@@ -198,7 +199,7 @@ class Evaluate:
             self.first_collision = self.env.is_collision & ~self.collided
             self.collided = self.collided | self.env.is_collision
 
-            if self.show or self.save_video:
+            if self.show or self.save:
                 render_list = rgba2rgb(
                     self.env.scene_manager.render(**self.render_kwargs)
                 )
