@@ -14,6 +14,7 @@ import pandas as pd
 import argparse
 from tqdm import trange
 from copy import deepcopy
+from gymnasium import spaces
 from pylogtools import timerlog
 
 timerlog.timer.print_logs(False)
@@ -40,13 +41,25 @@ def main(args):
     eval_config = deepcopy(config["env"])
     eval_config["num_envs"] = args.num_envs
 
+    if args.geodesic_mode != "native":
+        eval_config["use_geodesic_feature"] = False
+        if "scene_kwargs" in eval_config:
+            eval_config["scene_kwargs"]["load_geodesics"] = False
+
     env_class = env_aliases[config["env_class"]]
     env = env_class(requires_grad=False, **eval_config)
 
     policy_class = policy_aliases[config["policy_class"]]
     policy_kwargs = config["policy"]
     if policy_class == MultiInputPolicy:
-        observation_space = env.observation_space
+        observation_space = deepcopy(env.observation_space)
+        if args.geodesic_mode != "native" and "geodesic" not in observation_space.spaces:
+            observation_space.spaces["geodesic"] = spaces.Box(
+                low=-1.0, high=1.0, shape=(3,), dtype=np.float32
+            )
+            observation_space.spaces["geodesic_valid"] = spaces.Box(
+                low=0.0, high=1.0, shape=(1,), dtype=np.float32
+            )
         policy = policy_class(observation_space, **policy_kwargs)
     else:
         policy = policy_class(**policy_kwargs)
@@ -67,7 +80,7 @@ def main(args):
     else:
         save_path = args.save_path
 
-    e = Evaluate(env, policy)
+    e = Evaluate(env, policy, geodesic_mode=args.geodesic_mode)
 
     if args.run_name is None:
         run_name = create_name(args.weight.split(".")[0])
@@ -81,10 +94,31 @@ def main(args):
 
 
 class Evaluate:
-    def __init__(self, env, policy, render_kwargs=None):
+    def __init__(self, env, policy, render_kwargs=None, geodesic_mode=None):
         self.env = env
         self.policy = policy
         self.render_kwargs = render_kwargs or {}
+        self.geodesic_mode = geodesic_mode or getattr(env, "_eval_geodesic_mode", "native")
+
+    def _replace_geodesic(self, obs):
+        if self.geodesic_mode == "native":
+            return obs
+
+        obs = dict(obs)
+        target_direction = F.normalize(obs["target"][:, :3], dim=1, eps=1e-6)
+
+        if self.geodesic_mode == "target":
+            geodesic = target_direction
+        elif self.geodesic_mode == "zero":
+            geodesic = th.zeros_like(target_direction)
+        else:
+            raise ValueError(f"Unsupported geodesic_mode: {self.geodesic_mode}")
+
+        obs["geodesic"] = geodesic
+        obs["geodesic_valid"] = th.ones(
+            (geodesic.shape[0], 1), device=geodesic.device, dtype=geodesic.dtype
+        )
+        return obs
 
     @th.no_grad()
     def run_rollouts(self, num_rollouts=1, run_name=0, render=False):
@@ -205,6 +239,7 @@ class Evaluate:
         )
         while True:
             obs = observation_to_device(self.env.get_observation(), self.policy.device)
+            obs = self._replace_geodesic(obs)
             if type(self.policy) == MultiInputPolicy:
                 if self.policy.is_recurrent:
                     action, latent_state = self.policy(obs, latent_state)
@@ -371,5 +406,12 @@ if __name__ == "__main__":
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--num_envs", type=int, default=4)
     parser.add_argument("--num_rollouts", type=int, default=5)
+    parser.add_argument(
+        "--geodesic_mode",
+        type=str,
+        default="native",
+        choices=["native", "target", "zero"],
+        help="How to provide geodesic input at evaluation time.",
+    )
     args = parser.parse_args()
     main(args)
