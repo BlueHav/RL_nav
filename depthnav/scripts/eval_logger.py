@@ -53,7 +53,7 @@ def main(args):
     policy.load(args.weight)
     policy.eval()
 
-    def create_name(run_path, ext=".mp4"):
+    def create_name(run_path, ext=""):
         index = 1
         while True:
             path = f"{run_path}_{index}"
@@ -63,12 +63,16 @@ def main(args):
         return path
 
     if args.save_path is None:
-        save_path = create_name(args.cfg_file.split(".")[0])
+        save_path = create_name(args.cfg_file.split(".")[0], ext=".csv")
+    else:
+        save_path = args.save_path
 
     e = Evaluate(env, policy)
 
     if args.run_name is None:
         run_name = create_name(args.weight.split(".")[0])
+    else:
+        run_name = args.run_name
     df = e.run_rollouts(args.num_rollouts, run_name)
 
     write_header = not os.path.exists(save_path + ".csv")
