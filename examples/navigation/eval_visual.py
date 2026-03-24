@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import numpy as np
 import argparse
 from copy import deepcopy
+from gymnasium import spaces
 import matplotlib.pyplot as plt
 from pylogtools import timerlog
 
@@ -39,6 +40,13 @@ def main(args):
     eval_config["num_envs"] = args.num_envs
     eval_config["single_env"] = False
 
+    # For deployment-style ablations, synthesize geodesic from available signals
+    # instead of loading scene geodesic caches.
+    if args.geodesic_mode != "native":
+        eval_config["use_geodesic_feature"] = False
+        if "scene_kwargs" in eval_config:
+            eval_config["scene_kwargs"]["load_geodesics"] = False
+
     render_kwargs = {}
 
     eval_config["scene_kwargs"]["render_settings"] = {
@@ -57,7 +65,14 @@ def main(args):
     policy_class = policy_aliases[config["policy_class"]]
     policy_kwargs = config["policy"]
     if policy_class == MultiInputPolicy:
-        observation_space = env.observation_space
+        observation_space = deepcopy(env.observation_space)
+        if args.geodesic_mode != "native" and "geodesic" not in observation_space.spaces:
+            observation_space.spaces["geodesic"] = spaces.Box(
+                low=-1.0, high=1.0, shape=(3,), dtype=np.float32
+            )
+            observation_space.spaces["geodesic_valid"] = spaces.Box(
+                low=0.0, high=1.0, shape=(1,), dtype=np.float32
+            )
         policy = policy_class(observation_space, **policy_kwargs)
     else:
         policy = policy_class(**policy_kwargs)
@@ -87,6 +102,7 @@ def main(args):
         render_kwargs=render_kwargs,
         res=args.res,
         num_cols=args.num_envs,
+        geodesic_mode=args.geodesic_mode,
     )
     evaluate.run_rollouts(args.num_rollouts)
 
@@ -103,6 +119,7 @@ class Evaluate:
         res=512,
         num_rows=1,
         num_cols=4,
+        geodesic_mode="native",
     ):
         """
         renders the first num_cols * num_rows environments
@@ -119,12 +136,33 @@ class Evaluate:
         self.res = res
         self.num_rows = num_rows
         self.num_cols = num_cols
+        self.geodesic_mode = geodesic_mode
 
         self.render_grid = np.zeros((num_rows * res, num_cols * res, 3), dtype=np.uint8)
         self.collided = th.zeros(self.env.num_envs, dtype=th.bool)
         self.first_collision = th.zeros(self.env.num_envs, dtype=th.bool)
         self.done = th.zeros(self.env.num_envs, dtype=th.bool)
         self.all_frames = []
+
+    def _replace_geodesic(self, obs):
+        if self.geodesic_mode == "native":
+            return obs
+
+        obs = dict(obs)
+        target_direction = F.normalize(obs["target"][:, :3], dim=1, eps=1e-6)
+
+        if self.geodesic_mode == "target":
+            geodesic = target_direction
+        elif self.geodesic_mode == "zero":
+            geodesic = th.zeros_like(target_direction)
+        else:
+            raise ValueError(f"Unsupported geodesic_mode: {self.geodesic_mode}")
+
+        obs["geodesic"] = geodesic
+        obs["geodesic_valid"] = th.ones(
+            (geodesic.shape[0], 1), device=geodesic.device, dtype=geodesic.dtype
+        )
+        return obs
 
     @th.no_grad()
     def run_rollouts(self, num_rollouts=1):
@@ -188,6 +226,7 @@ class Evaluate:
         while True:
             start = time.time()
             obs = observation_to_device(self.env.get_observation(), self.policy.device)
+            obs = self._replace_geodesic(obs)
             if type(self.policy) == MultiInputPolicy:
                 if self.policy.is_recurrent:
                     action, latent_state = self.policy(obs, latent_state)
@@ -310,5 +349,12 @@ if __name__ == "__main__":
     parser.add_argument("--num_envs", type=int, default=4)
     parser.add_argument("--num_rollouts", type=int, default=10)
     parser.add_argument("--res", type=int, default=256)
+    parser.add_argument(
+        "--geodesic_mode",
+        type=str,
+        default="native",
+        choices=["native", "target", "zero"],
+        help="How to provide geodesic input at evaluation time.",
+    )
     args = parser.parse_args()
     main(args)
