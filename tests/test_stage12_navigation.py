@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 import torch as th
-from gymnasium import spaces
+
+spaces = pytest.importorskip('gymnasium', reason='gymnasium is required').spaces
 
 from depthnav.policies.extractors import StateTargetGeodesicSpatialExtractor
 from depthnav.policies.multi_input_policy import MultiInputPolicy

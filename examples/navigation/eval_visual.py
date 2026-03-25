@@ -18,8 +18,15 @@ timerlog.timer.print_logs(False)
 from depthnav.envs.env_aliases import env_aliases
 from depthnav.policies.policy_aliases import policy_aliases
 from depthnav.policies.multi_input_policy import MultiInputPolicy
-from depthnav.common import observation_to_device
-from depthnav.common import std_to_habitat, obs_list2array, rgba2rgb, replace_geodesic_observation
+from depthnav.common import (
+    SUPPORTED_GEODESIC_MODES,
+    observation_to_device,
+    std_to_habitat,
+    obs_list2array,
+    rgba2rgb,
+    replace_geodesic_observation,
+)
+from depthnav.topology_guidance import TopologyGuidance
 from depthnav.utils.paths import get_depthnav_agent_object_path
 
 
@@ -137,6 +144,9 @@ class Evaluate:
         self.num_rows = num_rows
         self.num_cols = num_cols
         self.geodesic_mode = geodesic_mode
+        self.geodesic_guidance = (
+            TopologyGuidance() if self.geodesic_mode == "topology" else None
+        )
 
         self.render_grid = np.zeros((num_rows * res, num_cols * res, 3), dtype=np.uint8)
         self.collided = th.zeros(self.env.num_envs, dtype=th.bool)
@@ -144,8 +154,19 @@ class Evaluate:
         self.done = th.zeros(self.env.num_envs, dtype=th.bool)
         self.all_frames = []
 
+    def _reset_geodesic_guidance(self):
+        if self.geodesic_guidance is not None:
+            self.geodesic_guidance.reset(batch_size=self.env.num_envs)
+
     def _replace_geodesic(self, obs):
-        return replace_geodesic_observation(obs, self.geodesic_mode)
+        return replace_geodesic_observation(
+            obs,
+            self.geodesic_mode,
+            guidance=self.geodesic_guidance,
+            positions=getattr(self.env, "position", None),
+            quaternions=getattr(self.env, "quaternion", None),
+            target_direction=getattr(self.env, "target_direction", None),
+        )
 
     @th.no_grad()
     def run_rollouts(self, num_rollouts=1):
@@ -178,6 +199,7 @@ class Evaluate:
 
     @th.no_grad()
     def single_rollout(self):
+        self._reset_geodesic_guidance()
         self.render_grid = np.zeros(
             (self.num_rows * self.res, self.num_cols * self.res, 3), dtype=np.uint8
         )
@@ -332,6 +354,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_envs", type=int, default=4)
     parser.add_argument("--num_rollouts", type=int, default=10)
     parser.add_argument("--res", type=int, default=256)
-    parser.add_argument("--geodesic_mode",type=str,default="depth_gradient")
+    parser.add_argument(
+        "--geodesic_mode",
+        type=str,
+        default="depth_gradient",
+        choices=SUPPORTED_GEODESIC_MODES,
+    )
     args = parser.parse_args()
     main(args)

@@ -6,6 +6,8 @@ from typing import Optional, Tuple, List
 from scipy.spatial.transform import Rotation as Rotation
 from enum import Enum
 
+from .topology_guidance import TopologyGuidance
+
 
 class ExitCode(Enum):
     SUCCESS = 0
@@ -122,24 +124,46 @@ def rgba2rgb(image):
 def observation_to_device(obs, device):
     return {k: v.to(device) for k, v in obs.items()}
 
+
+SUPPORTED_GEODESIC_MODES = (
+    "native",
+    "target",
+    "zero",
+    "depth_gradient",
+    "topology",
+)
+
+
 def _quaternion_wxyz_to_matrix(q: th.Tensor) -> th.Tensor:
     q = F.normalize(q, dim=1, eps=1e-6)
     w, x, y, z = q.unbind(dim=1)
 
-    row0 = th.stack([w * w + x * x - y * y - z * z, 2 * (x * y - w * z), 2 * (x * z + w * y)], dim=1)
-    row1 = th.stack([2 * (x * y + w * z), w * w - x * x + y * y - z * z, 2 * (y * z - w * x)], dim=1)
-    row2 = th.stack([2 * (x * z - w * y), 2 * (y * z + w * x), w * w - x * x - y * y + z * z], dim=1)
+    row0 = th.stack(
+        [w * w + x * x - y * y - z * z, 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        dim=1,
+    )
+    row1 = th.stack(
+        [2 * (x * y + w * z), w * w - x * x + y * y - z * z, 2 * (y * z - w * x)],
+        dim=1,
+    )
+    row2 = th.stack(
+        [2 * (x * z - w * y), 2 * (y * z + w * x), w * w - x * x - y * y + z * z],
+        dim=1,
+    )
     return th.stack([row0, row1, row2], dim=1)
 
 
-def _depth_gradient_geodesic(
-    depth: th.Tensor, state: th.Tensor, target_direction: th.Tensor, min_depth: float = 0.1
+def _depth_gradient_geodesic_from_pose(
+    depth: th.Tensor,
+    quaternions: th.Tensor,
+    target_direction: th.Tensor,
+    min_depth: float = 0.1,
 ) -> th.Tensor:
     if depth.ndim != 4 or depth.shape[1] != 1:
         raise ValueError(f"Expected depth shape (B,1,H,W), got {tuple(depth.shape)}")
 
     depth = th.nan_to_num(depth.float(), nan=0.0, posinf=0.0, neginf=0.0)
-    state = state.float()
+    quaternions = F.normalize(quaternions.float(), dim=1, eps=1e-6)
     target_direction = F.normalize(target_direction.float(), dim=1, eps=1e-6)
 
     batch_size, _, height, width = depth.shape
@@ -174,9 +198,11 @@ def _depth_gradient_geodesic(
     grid_x = xs.view(1, width).expand(height, width)
     grid_y = ys.view(height, 1).expand(height, width)
     rays_body = th.stack([th.ones_like(grid_x), -grid_x, -grid_y], dim=-1)
-    rays_body = F.normalize(rays_body, dim=-1, eps=1e-6).unsqueeze(0).expand(batch_size, -1, -1, -1)
+    rays_body = F.normalize(rays_body, dim=-1, eps=1e-6).unsqueeze(0).expand(
+        batch_size, -1, -1, -1
+    )
 
-    rot_ib = _quaternion_wxyz_to_matrix(state[:, :4]).to(device=device, dtype=dtype)
+    rot_ib = _quaternion_wxyz_to_matrix(quaternions).to(device=device, dtype=dtype)
     rays_inertial = th.einsum('bij,bhwj->bhwi', rot_ib, rays_body)
     alignment = (rays_inertial * target_direction[:, None, None, :]).sum(dim=-1).clamp_min(0.0)
 
@@ -186,32 +212,84 @@ def _depth_gradient_geodesic(
     flat_score = score.flatten(1)
     best_idx = flat_score.argmax(dim=1)
     best_score = flat_score.gather(1, best_idx.unsqueeze(1)).squeeze(1)
-    best_rays = rays_inertial.view(batch_size, -1, 3)[th.arange(batch_size, device=device), best_idx]
+    best_rays = rays_inertial.view(batch_size, -1, 3)[
+        th.arange(batch_size, device=device), best_idx
+    ]
 
     invalid = ~th.isfinite(best_score) | (best_score <= 0.0)
     best_rays = th.where(invalid[:, None], target_direction, best_rays)
     return F.normalize(best_rays, dim=1, eps=1e-6)
 
 
-def replace_geodesic_observation(obs, geodesic_mode: str = 'native'):
+def _depth_gradient_geodesic(
+    depth: th.Tensor, state: th.Tensor, target_direction: th.Tensor, min_depth: float = 0.1
+) -> th.Tensor:
+    return _depth_gradient_geodesic_from_pose(
+        depth, state[:, :4], target_direction, min_depth=min_depth
+    )
+
+
+def replace_geodesic_observation(
+    obs,
+    geodesic_mode: str = 'native',
+    guidance: Optional[TopologyGuidance] = None,
+    positions: Optional[th.Tensor] = None,
+    quaternions: Optional[th.Tensor] = None,
+    target_direction: Optional[th.Tensor] = None,
+):
     if geodesic_mode == 'native':
         return obs
 
-    obs = dict(obs)
-    target_direction = F.normalize(obs['target'][:, :3], dim=1, eps=1e-6)
+    if geodesic_mode not in SUPPORTED_GEODESIC_MODES:
+        raise ValueError(f'Unsupported geodesic_mode: {geodesic_mode}')
 
+    obs = dict(obs)
+    device = obs['depth'].device
+    dtype = obs['depth'].dtype
+
+    if target_direction is None:
+        target_direction = F.normalize(obs['target'][:, :3], dim=1, eps=1e-6)
+    else:
+        target_direction = F.normalize(
+            target_direction.to(device=device, dtype=dtype), dim=1, eps=1e-6
+        )
+
+    if quaternions is None:
+        quaternions = obs['state'][:, :4]
+    quaternions = F.normalize(quaternions.to(device=device, dtype=dtype), dim=1, eps=1e-6)
+
+    valid = th.ones((target_direction.shape[0], 1), device=device, dtype=dtype)
     if geodesic_mode == 'target':
         geodesic = target_direction
     elif geodesic_mode == 'zero':
         geodesic = th.zeros_like(target_direction)
     elif geodesic_mode == 'depth_gradient':
-        geodesic = _depth_gradient_geodesic(obs['depth'], obs['state'], target_direction)
+        geodesic = _depth_gradient_geodesic_from_pose(
+            obs['depth'], quaternions, target_direction
+        )
+    elif geodesic_mode == 'topology':
+        if guidance is None:
+            raise ValueError('Topology guidance mode requires a TopologyGuidance instance.')
+        if positions is None:
+            raise ValueError('Topology guidance mode requires current positions.')
+
+        positions = positions.to(device=device, dtype=dtype)
+        guidance.update(
+            depth=obs['depth'],
+            positions=positions,
+            quaternions=quaternions,
+            target_direction=target_direction,
+        )
+        topology_geodesic, topology_valid = guidance.best_direction()
+        fallback_geodesic = _depth_gradient_geodesic_from_pose(
+            obs['depth'], quaternions, target_direction
+        )
+        geodesic = th.where(topology_valid, topology_geodesic, fallback_geodesic)
+        valid = topology_valid.to(dtype=dtype)
     else:
         raise ValueError(f'Unsupported geodesic_mode: {geodesic_mode}')
 
-    obs['geodesic'] = geodesic
-    obs['geodesic_valid'] = th.ones(
-        (geodesic.shape[0], 1), device=geodesic.device, dtype=geodesic.dtype
-    )
+    obs['geodesic'] = F.normalize(geodesic, dim=1, eps=1e-6)
+    obs['geodesic_valid'] = valid
     return obs
 

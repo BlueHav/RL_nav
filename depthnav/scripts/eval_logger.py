@@ -21,7 +21,13 @@ timerlog.timer.print_logs(False)
 from depthnav.envs.env_aliases import env_aliases
 from depthnav.policies.policy_aliases import policy_aliases
 from depthnav.policies.multi_input_policy import MultiInputPolicy
-from depthnav.common import observation_to_device, rgba2rgb, replace_geodesic_observation
+from depthnav.common import (
+    SUPPORTED_GEODESIC_MODES,
+    observation_to_device,
+    rgba2rgb,
+    replace_geodesic_observation,
+)
+from depthnav.topology_guidance import TopologyGuidance
 
 
 def main(args):
@@ -98,9 +104,23 @@ class Evaluate:
         self.policy = policy
         self.render_kwargs = render_kwargs or {}
         self.geodesic_mode = geodesic_mode or getattr(env, "_eval_geodesic_mode", "native")
+        self.geodesic_guidance = (
+            TopologyGuidance() if self.geodesic_mode == "topology" else None
+        )
+
+    def _reset_geodesic_guidance(self):
+        if self.geodesic_guidance is not None:
+            self.geodesic_guidance.reset(batch_size=self.env.num_envs)
 
     def _replace_geodesic(self, obs):
-        return replace_geodesic_observation(obs, self.geodesic_mode)
+        return replace_geodesic_observation(
+            obs,
+            self.geodesic_mode,
+            guidance=self.geodesic_guidance,
+            positions=getattr(self.env, "position", None),
+            quaternions=getattr(self.env, "quaternion", None),
+            target_direction=getattr(self.env, "target_direction", None),
+        )
 
     @th.no_grad()
     def run_rollouts(self, num_rollouts=1, run_name=0, render=False):
@@ -184,6 +204,7 @@ class Evaluate:
 
     @th.no_grad()
     def single_rollout(self, render=False):
+        self._reset_geodesic_guidance()
         # For each agent in the batch
         agent_logs = [
             {
@@ -388,6 +409,11 @@ if __name__ == "__main__":
     parser.add_argument("--run_name", type=str, default="final_eval_level1_stage12")
     parser.add_argument("--num_envs", type=int, default=4)
     parser.add_argument("--num_rollouts", type=int, default=5)
-    parser.add_argument("--geodesic_mode",type=str,default="depth_gradient")
+    parser.add_argument(
+        "--geodesic_mode",
+        type=str,
+        default="depth_gradient",
+        choices=SUPPORTED_GEODESIC_MODES,
+    )
     args = parser.parse_args()
     main(args)

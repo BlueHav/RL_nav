@@ -13,7 +13,7 @@ from depthnav.policies.bptt_algorithm import BPTT
 from depthnav.envs.env_aliases import env_aliases
 from depthnav.policies.policy_aliases import policy_aliases
 from depthnav.policies.multi_input_policy import MultiInputPolicy
-from depthnav.common import ExitCode
+from depthnav.common import ExitCode, SUPPORTED_GEODESIC_MODES
 from depthnav.scripts.eval_logger import Evaluate
 from depthnav.utils.paths import get_depthnav_agent_object_path
 
@@ -120,7 +120,7 @@ if __name__ == "__main__":
         "--eval_geodesic_mode",
         type=str,
         default="native",
-        choices=["native", "target", "zero"],
+        choices=SUPPORTED_GEODESIC_MODES,
         help="How to provide geodesic input during automated evaluation.",
     )
     args = parser.parse_args()
