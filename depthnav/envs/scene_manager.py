@@ -916,7 +916,15 @@ class SceneManager:
         geodesic_path = scene_cfg.get("user_defined", {}).get("geodesic_path", "")
         full_geodesic_path = os.path.join(self.dataset_path, geodesic_path)
         if geodesic_path != "" and os.path.exists(full_geodesic_path):
-            data = np.load(full_geodesic_path)
+            try:
+                data = np.load(full_geodesic_path)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to load geodesic cache. "
+                    f"scene={scene_path}, geodesic={full_geodesic_path}. "
+                    "The cache is likely corrupted or partially written. "
+                    "Delete this .npz and regenerate geodesics for the scene set."
+                ) from exc
             self.geodesics[scene_id] = {
                 key: th.from_numpy(data[key]) for key in data.files
             }

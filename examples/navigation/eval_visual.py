@@ -19,7 +19,7 @@ from depthnav.envs.env_aliases import env_aliases
 from depthnav.policies.policy_aliases import policy_aliases
 from depthnav.policies.multi_input_policy import MultiInputPolicy
 from depthnav.common import observation_to_device
-from depthnav.common import std_to_habitat, obs_list2array, rgba2rgb
+from depthnav.common import std_to_habitat, obs_list2array, rgba2rgb, replace_geodesic_observation
 from depthnav.utils.paths import get_depthnav_agent_object_path
 
 
@@ -145,24 +145,7 @@ class Evaluate:
         self.all_frames = []
 
     def _replace_geodesic(self, obs):
-        if self.geodesic_mode == "native":
-            return obs
-
-        obs = dict(obs)
-        target_direction = F.normalize(obs["target"][:, :3], dim=1, eps=1e-6)
-
-        if self.geodesic_mode == "target":
-            geodesic = target_direction
-        elif self.geodesic_mode == "zero":
-            geodesic = th.zeros_like(target_direction)
-        else:
-            raise ValueError(f"Unsupported geodesic_mode: {self.geodesic_mode}")
-
-        obs["geodesic"] = geodesic
-        obs["geodesic_valid"] = th.ones(
-            (geodesic.shape[0], 1), device=geodesic.device, dtype=geodesic.dtype
-        )
-        return obs
+        return replace_geodesic_observation(obs, self.geodesic_mode)
 
     @th.no_grad()
     def run_rollouts(self, num_rollouts=1):
@@ -341,20 +324,17 @@ class Evaluate:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cfg_file", type=str, default="examples/navigation/eval_cfg/nav_level1.yaml")
-    parser.add_argument("--policy_cfg_file", type=str, default="examples/navigation/policy_cfg/small_yaw.yaml")
-    parser.add_argument("--weight", type=str, default=None, help="trained weight name")
+    parser.add_argument("--cfg_file", type=str, default="examples/navigation/eval_cfg/nav_level1_stage12.yaml")
+    parser.add_argument("--policy_cfg_file", type=str, default="examples/navigation/policy_cfg/stage12_yaw_geodesic.yaml")
+    parser.add_argument("--weight", type=str, default="/root/depthnav/examples/navigation/logs/level1_stage12/level1_stage12_6.pth")
     parser.add_argument("--render", action="store_true", help="Show observations")
-    parser.add_argument("--save_name", type=str, default=None)
+    parser.add_argument("--save_name", type=str, default="/root/depthnav/examples/navigation/logs/level1_stage12/final_eval_level1_stage12_vis_target")
     parser.add_argument("--num_envs", type=int, default=4)
     parser.add_argument("--num_rollouts", type=int, default=10)
     parser.add_argument("--res", type=int, default=256)
     parser.add_argument(
         "--geodesic_mode",
         type=str,
-        default="native",
-        choices=["native", "target", "zero"],
-        help="How to provide geodesic input at evaluation time.",
-    )
+        default="depth_gradient")
     args = parser.parse_args()
     main(args)

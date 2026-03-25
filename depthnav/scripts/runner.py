@@ -88,6 +88,7 @@ def run_experiment(
     curriculum=False,
     eval_configs=None,
     eval_csvs=None,
+    eval_geodesic_mode="native",
     max_retries=5,
 ):
     """curriculum will use weights from last run_name in next run"""
@@ -178,6 +179,9 @@ def run_experiment(
             command += f" --eval_csvs"
             for eval_csv in eval_csvs:
                 command += f" {eval_csv}"
+
+        if eval_geodesic_mode != "native":
+            command += f" --eval_geodesic_mode {eval_geodesic_mode}"
 
         print(command)
         run_with_retries(command, max_retries)

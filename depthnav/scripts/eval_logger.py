@@ -8,7 +8,6 @@ import os
 import yaml
 import time
 import torch as th
-import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import argparse
@@ -22,7 +21,7 @@ timerlog.timer.print_logs(False)
 from depthnav.envs.env_aliases import env_aliases
 from depthnav.policies.policy_aliases import policy_aliases
 from depthnav.policies.multi_input_policy import MultiInputPolicy
-from depthnav.common import observation_to_device, rgba2rgb
+from depthnav.common import observation_to_device, rgba2rgb, replace_geodesic_observation
 
 
 def main(args):
@@ -101,24 +100,7 @@ class Evaluate:
         self.geodesic_mode = geodesic_mode or getattr(env, "_eval_geodesic_mode", "native")
 
     def _replace_geodesic(self, obs):
-        if self.geodesic_mode == "native":
-            return obs
-
-        obs = dict(obs)
-        target_direction = F.normalize(obs["target"][:, :3], dim=1, eps=1e-6)
-
-        if self.geodesic_mode == "target":
-            geodesic = target_direction
-        elif self.geodesic_mode == "zero":
-            geodesic = th.zeros_like(target_direction)
-        else:
-            raise ValueError(f"Unsupported geodesic_mode: {self.geodesic_mode}")
-
-        obs["geodesic"] = geodesic
-        obs["geodesic_valid"] = th.ones(
-            (geodesic.shape[0], 1), device=geodesic.device, dtype=geodesic.dtype
-        )
-        return obs
+        return replace_geodesic_observation(obs, self.geodesic_mode)
 
     @th.no_grad()
     def run_rollouts(self, num_rollouts=1, run_name=0, render=False):
@@ -410,8 +392,8 @@ if __name__ == "__main__":
         "--geodesic_mode",
         type=str,
         default="native",
-        choices=["native", "target", "zero"],
-        help="How to provide geodesic input at evaluation time.",
+        choices=["native", "target", "zero", "depth_gradient"],
+        help="How to provide geodesic input at evaluation time; depth_gradient uses the current depth frame to synthesize a 3D direction.",
     )
     args = parser.parse_args()
     main(args)

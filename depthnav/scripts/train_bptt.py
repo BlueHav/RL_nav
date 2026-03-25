@@ -32,8 +32,13 @@ def main(args):
             with open(cfg_file, "r") as file:
                 eval_config = yaml.safe_load(file)
 
+            if args.eval_geodesic_mode != "native":
+                eval_config["env"]["use_geodesic_feature"] = False
+                if "scene_kwargs" in eval_config["env"]:
+                    eval_config["env"]["scene_kwargs"]["load_geodesics"] = False
+
             if args.render:
-                eval_config["scene_kwargs"]["render_settings"] = {
+                eval_config["env"]["scene_kwargs"]["render_settings"] = {
                     "mode": "follow",
                     "view": "back",
                     "sensor_type": "color",
@@ -46,6 +51,7 @@ def main(args):
 
             env_class = env_aliases[config["env_class"]]
             eval_env = env_class(requires_grad=False, **eval_config["env"])
+            eval_env._eval_geodesic_mode = args.eval_geodesic_mode
             eval_envs.append(eval_env)
 
     # load policy
@@ -109,6 +115,13 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="list of paths to write eval stats",
+    )
+    parser.add_argument(
+        "--eval_geodesic_mode",
+        type=str,
+        default="native",
+        choices=["native", "target", "zero"],
+        help="How to provide geodesic input during automated evaluation.",
     )
     args = parser.parse_args()
     main(args)
