@@ -332,9 +332,6 @@ if __name__ == "__main__":
     parser.add_argument("--num_envs", type=int, default=4)
     parser.add_argument("--num_rollouts", type=int, default=10)
     parser.add_argument("--res", type=int, default=256)
-    parser.add_argument(
-        "--geodesic_mode",
-        type=str,
-        default="depth_gradient")
+    parser.add_argument("--geodesic_mode",type=str,default="depth_gradient")
     args = parser.parse_args()
     main(args)

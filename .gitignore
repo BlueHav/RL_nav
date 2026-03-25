@@ -213,3 +213,5 @@ __marimo__/
 datasets/depthnav_dataset
 examples/navigation/logs/
 examples/navigation/eval_visual1.py
+FUEL/
+

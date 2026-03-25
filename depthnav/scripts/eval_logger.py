@@ -381,19 +381,13 @@ class Evaluate:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cfg_file", type=str, default="examples/navigation/eval_cfg/nav_level1.yaml")
-    parser.add_argument("--policy_cfg_file", type=str, default="examples/navigation/policy_cfg/small_yaw.yaml")
-    parser.add_argument("--weight", type=str, default=None, help="trained weight name")
-    parser.add_argument("--save_path", type=str, default=None)
-    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--cfg_file", type=str, default="examples/navigation/eval_cfg/nav_level1_stage12.yaml")
+    parser.add_argument("--policy_cfg_file", type=str, default="examples/navigation/policy_cfg/stage12_yaw_geodesic.yaml")
+    parser.add_argument("--weight", type=str, default="/root/depthnav/examples/navigation/logs/level1_stage12/level1_stage12_6.pth", help="trained weight name")
+    parser.add_argument("--save_path", type=str, default="/root/depthnav/examples/navigation/logs/level1_stage12")
+    parser.add_argument("--run_name", type=str, default="final_eval_level1_stage12")
     parser.add_argument("--num_envs", type=int, default=4)
     parser.add_argument("--num_rollouts", type=int, default=5)
-    parser.add_argument(
-        "--geodesic_mode",
-        type=str,
-        default="native",
-        choices=["native", "target", "zero", "depth_gradient"],
-        help="How to provide geodesic input at evaluation time; depth_gradient uses the current depth frame to synthesize a 3D direction.",
-    )
+    parser.add_argument("--geodesic_mode",type=str,default="depth_gradient")
     args = parser.parse_args()
     main(args)
