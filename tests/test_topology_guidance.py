@@ -116,6 +116,32 @@ def test_topology_guidance_downweights_closed_nodes_and_reset_clears_graph():
     assert guidance.graphs == [[]]
 
 
+def test_topology_only_steers_from_currently_visible_nodes():
+    guidance = TopologyGuidance(min_sector_width_px=4)
+    position, quaternion, target_direction, state, target = make_pose()
+
+    open_obs = make_obs(make_depth(openings=[(44, 84)]), state, target)
+    closed_obs = make_obs(make_depth(openings=[]), state, target)
+    replace_geodesic_observation(
+        open_obs,
+        geodesic_mode='topology',
+        guidance=guidance,
+        positions=position,
+        quaternions=quaternion,
+        target_direction=target_direction,
+    )
+    closed = replace_geodesic_observation(
+        closed_obs,
+        geodesic_mode='topology',
+        guidance=guidance,
+        positions=position,
+        quaternions=quaternion,
+        target_direction=target_direction,
+    )
+
+    assert closed['geodesic_valid'][0, 0].item() == 0.0
+
+
 def test_replace_geodesic_observation_topology_preserves_interface_and_falls_back():
     guidance = TopologyGuidance(min_sector_width_px=4)
     position, quaternion, target_direction, state, target = make_pose()
@@ -134,6 +160,32 @@ def test_replace_geodesic_observation_topology_preserves_interface_and_falls_bac
     assert replaced['geodesic_valid'].shape == (1, 1)
     assert replaced['geodesic_valid'][0, 0].item() == 0.0
     assert th.allclose(replaced['geodesic'].norm(dim=1), th.ones(1), atol=1e-4)
+
+
+def test_topology_geodesic_stays_close_to_depth_gradient_baseline():
+    guidance = TopologyGuidance(min_sector_width_px=4)
+    position, quaternion, target_direction, state, target = make_pose()
+    obs = make_obs(make_depth(openings=[(52, 96)]), state, target)
+
+    depth_gradient = replace_geodesic_observation(
+        obs,
+        geodesic_mode='depth_gradient',
+        quaternions=quaternion,
+        target_direction=target_direction,
+    )
+    topology = replace_geodesic_observation(
+        obs,
+        geodesic_mode='topology',
+        guidance=guidance,
+        positions=position,
+        quaternions=quaternion,
+        target_direction=target_direction,
+    )
+
+    cosine = th.nn.functional.cosine_similarity(
+        depth_gradient['geodesic'], topology['geodesic'], dim=1
+    )
+    assert cosine[0] > 0.95
 
 
 def test_topology_geodesic_replacement_stays_policy_compatible():

@@ -99,6 +99,10 @@ class TopologyGuidance:
         score_width_norm: float = 0.12,
         score_clearance_norm: float = 3.0,
         score_support_norm: float = 10.0,
+        anchor_max_angle_deg: float = 28.0,
+        min_output_blend: float = 0.12,
+        max_output_blend: float = 0.40,
+        min_selection_score: float = 0.75,
     ) -> None:
         self.min_depth = min_depth
         self.min_clearance = min_clearance
@@ -117,6 +121,13 @@ class TopologyGuidance:
         self.score_width_norm = score_width_norm
         self.score_clearance_norm = score_clearance_norm
         self.score_support_norm = score_support_norm
+        self.anchor_max_angle = th.deg2rad(th.tensor(anchor_max_angle_deg)).item()
+        self.anchor_min_alignment = float(
+            th.cos(th.tensor(self.anchor_max_angle)).item()
+        )
+        self.min_output_blend = min_output_blend
+        self.max_output_blend = max_output_blend
+        self.min_selection_score = min_selection_score
 
         self._batch_size = 0
         self.reset()
@@ -132,6 +143,7 @@ class TopologyGuidance:
         self._current_positions: Optional[th.Tensor] = None
         self._current_quaternions: Optional[th.Tensor] = None
         self._current_target_direction: Optional[th.Tensor] = None
+        self._current_base_direction: Optional[th.Tensor] = None
         self._current_image_shape: Optional[Tuple[int, int]] = None
         self._next_node_id = 0
 
@@ -444,6 +456,7 @@ class TopologyGuidance:
         positions: th.Tensor,
         quaternions: th.Tensor,
         target_direction: th.Tensor,
+        base_direction: Optional[th.Tensor] = None,
     ) -> None:
         batch_size = depth.shape[0]
         self._ensure_batch_size(batch_size)
@@ -456,11 +469,18 @@ class TopologyGuidance:
         target_direction = self._safe_normalize(
             target_direction.to(device=device, dtype=depth.dtype), dim=1
         )
+        if base_direction is None:
+            base_direction = target_direction
+        else:
+            base_direction = self._safe_normalize(
+                base_direction.to(device=device, dtype=depth.dtype), dim=1
+            )
 
         candidates, metas = self._extract_candidates_batch(depth, positions, quaternions)
         self._current_positions = positions.detach().clone()
         self._current_quaternions = quaternions.detach().clone()
         self._current_target_direction = target_direction.detach().clone()
+        self._current_base_direction = base_direction.detach().clone()
         self._current_image_shape = (depth.shape[2], depth.shape[3])
 
         for env_index in range(batch_size):
@@ -479,6 +499,7 @@ class TopologyGuidance:
             self._current_positions is None
             or self._current_quaternions is None
             or self._current_target_direction is None
+            or self._current_base_direction is None
         ):
             raise RuntimeError('TopologyGuidance.best_direction() called before update().')
 
@@ -495,13 +516,13 @@ class TopologyGuidance:
             position = self._current_positions[env_index]
             quaternion = self._current_quaternions[env_index]
             target_direction = self._current_target_direction[env_index]
-            forward = _quaternion_wxyz_to_matrix(quaternion.unsqueeze(0))[0, :, 0]
+            base_direction = self._current_base_direction[env_index]
             turn_reference = self._last_selected_direction[env_index]
             if turn_reference is None:
-                turn_reference = forward
+                turn_reference = base_direction
 
             best_score = None
-            best_direction = target_direction
+            best_direction = base_direction
 
             for node in self.graphs[env_index]:
                 predicted_vec = node.position - position
@@ -518,8 +539,23 @@ class TopologyGuidance:
                 )
                 if projection is None:
                     continue
+                if node.last_seen != self._step_index[env_index]:
+                    continue
 
-                goal_alignment = float(th.dot(predicted_direction, target_direction).item())
+                anchor_alignment = float(th.dot(predicted_direction, base_direction).item())
+                if anchor_alignment < self.anchor_min_alignment:
+                    continue
+                anchor_score = max(
+                    0.0,
+                    min(
+                        1.0,
+                        (anchor_alignment - self.anchor_min_alignment)
+                        / max(1.0 - self.anchor_min_alignment, 1e-6),
+                    ),
+                )
+                goal_alignment = max(
+                    0.0, float(th.dot(predicted_direction, target_direction).item())
+                )
                 clearance_score = float(
                     th.tanh(
                         th.tensor(
@@ -529,11 +565,11 @@ class TopologyGuidance:
                     ).item()
                 )
                 width_score = min(
-                    node.angular_width / max(self.score_width_norm, 1e-6), 1.5
+                    node.angular_width / max(self.score_width_norm, 1e-6), 1.0
                 )
                 persistence_score = min(
-                    node.support / max(self.score_support_norm, 1e-6), 1.5
-                ) * min(node.confidence, 1.5)
+                    node.support / max(self.score_support_norm, 1e-6), 1.0
+                ) * min(node.confidence, 1.0)
                 turning_cost = 1.0 - float(
                     th.dot(
                         predicted_direction,
@@ -545,22 +581,38 @@ class TopologyGuidance:
                 ) / max(self.max_staleness, 1)
 
                 score = (
-                    1.35 * goal_alignment
-                    + 0.70 * clearance_score
-                    + 0.40 * width_score
-                    + 0.55 * persistence_score
-                    - 0.35 * turning_cost
-                    - 0.45 * staleness_penalty
+                    1.55 * anchor_score
+                    + 0.45 * goal_alignment
+                    + 0.40 * clearance_score
+                    + 0.20 * width_score
+                    + 0.35 * persistence_score
+                    - 0.18 * turning_cost
+                    - 0.25 * staleness_penalty
                 )
+                if best_score is not None and score <= best_score:
+                    continue
 
-                if best_score is None or score > best_score:
-                    best_score = score
-                    best_direction = predicted_direction
+                stability = 0.5 * min(node.confidence, 1.0) + 0.5 * min(
+                    node.support / max(self.score_support_norm, 1e-6), 1.0
+                )
+                blend = self.min_output_blend + (
+                    self.max_output_blend - self.min_output_blend
+                ) * anchor_score * stability
+                blend = min(self.max_output_blend, max(self.min_output_blend, blend))
+                blended_direction = self._safe_normalize(
+                    (1.0 - blend) * base_direction + blend * predicted_direction,
+                    dim=0,
+                )
+                best_score = score
+                best_direction = blended_direction
 
-            if best_score is not None:
+            if best_score is not None and best_score >= self.min_selection_score:
                 valid_mask[env_index, 0] = True
-                best_direction = self._safe_normalize(best_direction, dim=0)
-                self._last_selected_direction[env_index] = best_direction.detach().clone()
+            else:
+                best_direction = base_direction
+
+            best_direction = self._safe_normalize(best_direction, dim=0)
+            self._last_selected_direction[env_index] = best_direction.detach().clone()
             directions.append(best_direction.detach().clone())
 
         return th.stack(directions, dim=0), valid_mask

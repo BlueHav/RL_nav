@@ -274,16 +274,17 @@ def replace_geodesic_observation(
             raise ValueError('Topology guidance mode requires current positions.')
 
         positions = positions.to(device=device, dtype=dtype)
+        fallback_geodesic = _depth_gradient_geodesic_from_pose(
+            obs['depth'], quaternions, target_direction
+        )
         guidance.update(
             depth=obs['depth'],
             positions=positions,
             quaternions=quaternions,
             target_direction=target_direction,
+            base_direction=fallback_geodesic,
         )
         topology_geodesic, topology_valid = guidance.best_direction()
-        fallback_geodesic = _depth_gradient_geodesic_from_pose(
-            obs['depth'], quaternions, target_direction
-        )
         geodesic = th.where(topology_valid, topology_geodesic, fallback_geodesic)
         valid = topology_valid.to(dtype=dtype)
     else:
