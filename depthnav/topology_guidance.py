@@ -1,0 +1,737 @@
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+import torch as th
+import torch.nn.functional as F
+
+
+def _quaternion_wxyz_to_matrix(q: th.Tensor) -> th.Tensor:
+    q = F.normalize(q, dim=1, eps=1e-6)
+    w, x, y, z = q.unbind(dim=1)
+
+    row0 = th.stack(
+        [
+            w * w + x * x - y * y - z * z,
+            2 * (x * y - w * z),
+            2 * (x * z + w * y),
+        ],
+        dim=1,
+    )
+    row1 = th.stack(
+        [
+            2 * (x * y + w * z),
+            w * w - x * x + y * y - z * z,
+            2 * (y * z - w * x),
+        ],
+        dim=1,
+    )
+    row2 = th.stack(
+        [
+            2 * (x * z - w * y),
+            2 * (y * z + w * x),
+            w * w - x * x - y * y + z * z,
+        ],
+        dim=1,
+    )
+    return th.stack([row0, row1, row2], dim=1)
+
+
+def _extract_runs(mask: th.Tensor) -> List[Tuple[int, int]]:
+    runs: List[Tuple[int, int]] = []
+    start: Optional[int] = None
+    for index, is_open in enumerate(mask.tolist()):
+        if is_open and start is None:
+            start = index
+        elif not is_open and start is not None:
+            runs.append((start, index))
+            start = None
+    if start is not None:
+        runs.append((start, len(mask)))
+    return runs
+
+
+@dataclass
+class TopologyCandidate:
+    position: th.Tensor
+    direction: th.Tensor
+    clearance: float
+    angular_width: float
+    support: float
+    confidence: float
+
+
+@dataclass
+class TopologyNode:
+    node_id: int
+    position: th.Tensor
+    direction: th.Tensor
+    clearance: float
+    angular_width: float
+    support: float
+    confidence: float
+    age: int
+    last_seen: int
+
+
+@dataclass
+class TopologyExtractionMeta:
+    column_score: th.Tensor
+    traversability: th.Tensor
+    smoothed_depth: th.Tensor
+
+
+class TopologyGuidance:
+    def __init__(
+        self,
+        min_depth: float = 0.1,
+        min_clearance: float = 0.75,
+        open_score_threshold: float = 0.22,
+        min_sector_width_px: int = 8,
+        match_angle_threshold_deg: float = 18.0,
+        match_clearance_threshold: float = 1.5,
+        ema_alpha: float = 0.45,
+        unmatched_decay: float = 0.88,
+        closed_node_decay: float = 0.45,
+        min_node_confidence: float = 0.15,
+        max_staleness: int = 240,
+        max_nodes: int = 8,
+        score_width_norm: float = 0.12,
+        score_clearance_norm: float = 3.0,
+        score_support_norm: float = 10.0,
+        anchor_max_angle_deg: float = 80.0,
+        min_output_blend: float = 0.12,
+        max_output_blend: float = 0.40,
+        min_selection_score: float = 0.75,
+        # new params for front-blocked reverse escape
+        front_patch_radius_px: int = 2,
+        front_blocked_depth_factor: float = 1.10,
+        front_blocked_score_factor: float = 1.10,
+        front_relaxed_anchor_min_alignment: float = -0.50,
+        front_anchor_score_scale: float = 0.65,
+        escape_reverse_weight: float = 0.90,
+        escape_clearance_weight: float = 0.40,
+        escape_width_weight: float = 0.20,
+        escape_confidence_weight: float = 0.25,
+        reverse_confidence_trigger_dot: float = -0.20,
+        reverse_confidence_boost: float = 0.35,
+    ) -> None:
+        self.min_depth = min_depth
+        self.min_clearance = min_clearance
+        self.open_score_threshold = open_score_threshold
+        self.min_sector_width_px = min_sector_width_px
+        self.match_angle_threshold = th.deg2rad(
+            th.tensor(match_angle_threshold_deg)
+        ).item()
+        self.match_clearance_threshold = match_clearance_threshold
+        self.ema_alpha = ema_alpha
+        self.unmatched_decay = unmatched_decay
+        self.closed_node_decay = closed_node_decay
+        self.min_node_confidence = min_node_confidence
+        self.max_staleness = max_staleness
+        self.max_nodes = max_nodes
+        self.score_width_norm = score_width_norm
+        self.score_clearance_norm = score_clearance_norm
+        self.score_support_norm = score_support_norm
+        self.anchor_max_angle = th.deg2rad(th.tensor(anchor_max_angle_deg)).item()
+        self.anchor_min_alignment = float(
+            th.cos(th.tensor(self.anchor_max_angle)).item()
+        )
+        self.min_output_blend = min_output_blend
+        self.max_output_blend = max_output_blend
+        self.min_selection_score = min_selection_score
+
+        # new params
+        self.front_patch_radius_px = max(0, int(front_patch_radius_px))
+        self.front_blocked_depth_factor = front_blocked_depth_factor
+        self.front_blocked_score_factor = front_blocked_score_factor
+        self.front_relaxed_anchor_min_alignment = front_relaxed_anchor_min_alignment
+        self.front_anchor_score_scale = front_anchor_score_scale
+        self.escape_reverse_weight = escape_reverse_weight
+        self.escape_clearance_weight = escape_clearance_weight
+        self.escape_width_weight = escape_width_weight
+        self.escape_confidence_weight = escape_confidence_weight
+        self.reverse_confidence_trigger_dot = reverse_confidence_trigger_dot
+        self.reverse_confidence_boost = reverse_confidence_boost
+
+        self._batch_size = 0
+        self.reset()
+
+    def reset(self, batch_size: Optional[int] = None) -> None:
+        if batch_size is not None:
+            self._batch_size = int(batch_size)
+        self.graphs: List[List[TopologyNode]] = [[] for _ in range(self._batch_size)]
+        self._step_index = [0 for _ in range(self._batch_size)]
+        self._last_selected_direction: List[Optional[th.Tensor]] = [
+            None for _ in range(self._batch_size)
+        ]
+        self._current_positions: Optional[th.Tensor] = None
+        self._current_quaternions: Optional[th.Tensor] = None
+        self._current_target_direction: Optional[th.Tensor] = None
+        self._current_base_direction: Optional[th.Tensor] = None
+        self._current_image_shape: Optional[Tuple[int, int]] = None
+        self._current_metas: Optional[List[TopologyExtractionMeta]] = None
+        self._next_node_id = 0
+
+    def _ensure_batch_size(self, batch_size: int) -> None:
+        if self._batch_size != batch_size:
+            self.reset(batch_size=batch_size)
+
+    @staticmethod
+    def _safe_normalize(vec: th.Tensor, dim: int = -1) -> th.Tensor:
+        return F.normalize(vec, dim=dim, eps=1e-6)
+
+    @staticmethod
+    def _make_camera_rays(
+        quaternions: th.Tensor, height: int, width: int, dtype: th.dtype
+    ) -> th.Tensor:
+        device = quaternions.device
+        xs = th.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
+        ys = th.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
+        grid_x = xs.view(1, width).expand(height, width)
+        grid_y = ys.view(height, 1).expand(height, width)
+        rays_body = th.stack([th.ones_like(grid_x), -grid_x, -grid_y], dim=-1)
+        rays_body = F.normalize(rays_body, dim=-1, eps=1e-6)
+        rot = _quaternion_wxyz_to_matrix(quaternions.to(dtype=dtype))
+        return th.einsum('bij,hwj->bhwi', rot, rays_body)
+
+    def _extract_candidates_batch(
+        self,
+        depth: th.Tensor,
+        positions: th.Tensor,
+        quaternions: th.Tensor,
+    ) -> Tuple[List[List[TopologyCandidate]], List[TopologyExtractionMeta]]:
+        depth = th.nan_to_num(depth.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        batch_size, _, height, width = depth.shape
+        device = depth.device
+        dtype = depth.dtype
+
+        smoothed_depth = F.avg_pool2d(depth, kernel_size=5, stride=1, padding=2)
+        valid_mask = smoothed_depth > self.min_depth
+
+        sobel_x = th.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            device=device,
+            dtype=dtype,
+        ).view(1, 1, 3, 3) / 8.0
+        sobel_y = th.tensor(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            device=device,
+            dtype=dtype,
+        ).view(1, 1, 3, 3) / 8.0
+
+        grad_x = F.conv2d(smoothed_depth, sobel_x, padding=1)
+        grad_y = F.conv2d(smoothed_depth, sobel_y, padding=1)
+        grad_mag = th.sqrt(grad_x.square() + grad_y.square())
+
+        depth_scale = smoothed_depth.amax(dim=(2, 3), keepdim=True).clamp_min(
+            self.min_depth
+        )
+        grad_scale = grad_mag.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+        depth_score = (smoothed_depth / depth_scale).clamp(0.0, 1.0).squeeze(1)
+        smooth_score = (1.0 - grad_mag / grad_scale).clamp(0.0, 1.0).squeeze(1)
+
+        ys = th.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
+        row_weight = (1.0 - 0.35 * ys.abs()).view(1, height, 1)
+        traversability = (
+            valid_mask.squeeze(1).float()
+            * (0.75 * depth_score + 0.25 * smooth_score)
+            * row_weight
+        )
+
+        column_score = traversability.amax(dim=1)
+        column_score = F.avg_pool1d(
+            column_score.unsqueeze(1), kernel_size=5, stride=1, padding=2
+        ).squeeze(1)
+        column_clearance = smoothed_depth.squeeze(1).amax(dim=1)
+        open_mask = (column_score > self.open_score_threshold) & (
+            column_clearance > self.min_clearance
+        )
+
+        rays_world = self._make_camera_rays(quaternions, height, width, dtype)
+        candidates: List[List[TopologyCandidate]] = []
+        metas: List[TopologyExtractionMeta] = []
+
+        for batch_index in range(batch_size):
+            runs = _extract_runs(open_mask[batch_index])
+            env_candidates: List[TopologyCandidate] = []
+            for start, end in runs:
+                width_px = end - start
+                if width_px < self.min_sector_width_px:
+                    continue
+
+                segment_scores = column_score[batch_index, start:end].clamp_min(1e-6)
+                segment_indices = th.arange(start, end, device=device, dtype=dtype)
+                center_col = int(
+                    th.round(
+                        (segment_scores * segment_indices).sum() / segment_scores.sum()
+                    ).item()
+                )
+                center_col = max(0, min(center_col, width - 1))
+
+                row_scores = traversability[batch_index, :, center_col].clamp_min(1e-6)
+                row_indices = th.arange(height, device=device, dtype=dtype)
+                center_row = int(
+                    th.round((row_scores * row_indices).sum() / row_scores.sum()).item()
+                )
+                center_row = max(0, min(center_row, height - 1))
+
+                clearance_patch = smoothed_depth[
+                    batch_index,
+                    0,
+                    max(0, center_row - 1) : min(height, center_row + 2),
+                    start:end,
+                ]
+                clearance = float(clearance_patch.amax().item())
+                direction = self._safe_normalize(
+                    rays_world[batch_index, center_row, center_col], dim=0
+                )
+                position = positions[batch_index] + direction * clearance
+                angular_width = float(width_px / max(width, 1))
+                support = float(width_px)
+                avg_segment_score = float(segment_scores.mean().item())
+                confidence = min(1.5, 0.7 * avg_segment_score + 0.8 * angular_width)
+
+                env_candidates.append(
+                    TopologyCandidate(
+                        position=position.detach().clone(),
+                        direction=direction.detach().clone(),
+                        clearance=clearance,
+                        angular_width=angular_width,
+                        support=support,
+                        confidence=confidence,
+                    )
+                )
+
+            env_candidates.sort(key=lambda node: node.confidence, reverse=True)
+            candidates.append(env_candidates)
+            metas.append(
+                TopologyExtractionMeta(
+                    column_score=column_score[batch_index].detach().clone(),
+                    traversability=traversability[batch_index].detach().clone(),
+                    smoothed_depth=smoothed_depth[batch_index, 0].detach().clone(),
+                )
+            )
+
+        return candidates, metas
+
+    @staticmethod
+    def _angle_between(vec_a: th.Tensor, vec_b: th.Tensor) -> float:
+        dot = th.clamp(th.dot(vec_a, vec_b), -1.0, 1.0)
+        return float(th.acos(dot).item())
+
+    def _project_direction_to_image(
+        self,
+        direction_world: th.Tensor,
+        quaternion: th.Tensor,
+        height: int,
+        width: int,
+    ) -> Optional[Tuple[int, int, float]]:
+        rot = _quaternion_wxyz_to_matrix(quaternion.unsqueeze(0))[0]
+        direction_body = rot.transpose(0, 1) @ direction_world
+        forward = float(direction_body[0].item())
+        if forward <= 1e-4:
+            return None
+
+        grid_x = float((-direction_body[1] / forward).item())
+        grid_y = float((-direction_body[2] / forward).item())
+        if abs(grid_x) > 1.2 or abs(grid_y) > 1.2:
+            return None
+
+        col = int(round(((max(-1.0, min(1.0, grid_x)) + 1.0) * 0.5) * (width - 1)))
+        row = int(round(((max(-1.0, min(1.0, grid_y)) + 1.0) * 0.5) * (height - 1)))
+        return row, col, forward
+
+    @staticmethod
+    def _local_patch_mean(tensor_2d: th.Tensor, row: int, col: int, radius: int) -> float:
+        height, width = tensor_2d.shape
+        r0 = max(0, row - radius)
+        r1 = min(height, row + radius + 1)
+        c0 = max(0, col - radius)
+        c1 = min(width, col + radius + 1)
+        patch = tensor_2d[r0:r1, c0:c1]
+        if patch.numel() == 0:
+            return 0.0
+        return float(patch.mean().item())
+
+    def _estimate_front_blocked(
+        self,
+        env_index: int,
+        base_direction: th.Tensor,
+        quaternion: th.Tensor,
+        height: int,
+        width: int,
+    ) -> Tuple[bool, float, float]:
+        if self._current_metas is None:
+            return False, float("inf"), 1.0
+
+        meta = self._current_metas[env_index]
+        projection = self._project_direction_to_image(
+            base_direction,
+            quaternion,
+            height=height,
+            width=width,
+        )
+        if projection is None:
+            row = height // 2
+            col = width // 2
+        else:
+            row, col, _ = projection
+
+        front_depth = self._local_patch_mean(
+            meta.smoothed_depth, row, col, self.front_patch_radius_px
+        )
+        front_score = self._local_patch_mean(
+            meta.traversability, row, col, self.front_patch_radius_px
+        )
+
+        blocked_by_depth = (
+            front_depth < self.front_blocked_depth_factor * self.min_clearance
+        )
+        blocked_by_score = (
+            front_score < self.front_blocked_score_factor * self.open_score_threshold
+        )
+        return blocked_by_depth or blocked_by_score, front_depth, front_score
+
+    def _update_env_graph(
+        self,
+        env_index: int,
+        candidates: List[TopologyCandidate],
+        meta: TopologyExtractionMeta,
+        position: th.Tensor,
+        quaternion: th.Tensor,
+    ) -> None:
+        nodes = self.graphs[env_index]
+        current_step = self._step_index[env_index]
+        for node in nodes:
+            node.age += 1
+
+        matched_candidate_indices = set()
+        for node in nodes:
+            predicted_vec = node.position - position
+            predicted_clearance = float(predicted_vec.norm().item())
+            if predicted_clearance <= 1e-4:
+                continue
+            predicted_direction = self._safe_normalize(predicted_vec, dim=0)
+
+            best_index = None
+            best_cost = None
+            for candidate_index, candidate in enumerate(candidates):
+                if candidate_index in matched_candidate_indices:
+                    continue
+                angle_error = self._angle_between(predicted_direction, candidate.direction)
+                clearance_error = abs(predicted_clearance - candidate.clearance)
+                if angle_error > self.match_angle_threshold:
+                    continue
+                if clearance_error > self.match_clearance_threshold:
+                    continue
+                cost = (
+                    angle_error / max(self.match_angle_threshold, 1e-6)
+                    + clearance_error / max(self.match_clearance_threshold, 1e-6)
+                    - 0.15 * candidate.confidence
+                )
+                if best_cost is None or cost < best_cost:
+                    best_cost = cost
+                    best_index = candidate_index
+
+            if best_index is None:
+                projection = self._project_direction_to_image(
+                    predicted_direction,
+                    quaternion,
+                    meta.traversability.shape[0],
+                    meta.traversability.shape[1],
+                )
+                node.confidence *= self.unmatched_decay
+                if projection is not None:
+                    row, col, _ = projection
+                    local_score = float(meta.traversability[row, col].item())
+                    local_depth = float(meta.smoothed_depth[row, col].item())
+                    if local_score < self.open_score_threshold or local_depth < (
+                        0.75 * predicted_clearance
+                    ):
+                        node.confidence *= self.closed_node_decay
+                continue
+
+            candidate = candidates[best_index]
+            matched_candidate_indices.add(best_index)
+            predicted_direction = self._safe_normalize(node.position - position, dim=0)
+            node.position = th.lerp(
+                node.position, candidate.position.to(node.position.device), self.ema_alpha
+            ).detach()
+            node.direction = self._safe_normalize(
+                th.lerp(
+                    predicted_direction,
+                    candidate.direction.to(node.direction.device),
+                    self.ema_alpha,
+                ),
+                dim=0,
+            ).detach()
+            node.clearance = (
+                (1.0 - self.ema_alpha) * predicted_clearance
+                + self.ema_alpha * candidate.clearance
+            )
+            node.angular_width = (
+                (1.0 - self.ema_alpha) * node.angular_width
+                + self.ema_alpha * candidate.angular_width
+            )
+            node.support = min(
+                node.support + 0.5 * candidate.support, 2.0 * self.score_support_norm
+            )
+            node.confidence = min(
+                1.5,
+                (1.0 - self.ema_alpha) * node.confidence
+                + self.ema_alpha * candidate.confidence
+                + 0.1,
+            )
+            node.last_seen = current_step
+
+        for candidate_index, candidate in enumerate(candidates):
+            if candidate_index in matched_candidate_indices:
+                continue
+            nodes.append(
+                TopologyNode(
+                    node_id=self._next_node_id,
+                    position=candidate.position.detach().clone(),
+                    direction=candidate.direction.detach().clone(),
+                    clearance=candidate.clearance,
+                    angular_width=candidate.angular_width,
+                    support=candidate.support,
+                    confidence=candidate.confidence,
+                    age=1,
+                    last_seen=current_step,
+                )
+            )
+            self._next_node_id += 1
+
+        pruned_nodes: List[TopologyNode] = []
+        for node in nodes:
+            staleness = current_step - node.last_seen
+            predicted_clearance = float((node.position - position).norm().item())
+            if node.confidence < self.min_node_confidence:
+                continue
+            if staleness > self.max_staleness:
+                continue
+            if predicted_clearance < 0.25:
+                continue
+            pruned_nodes.append(node)
+
+        pruned_nodes.sort(
+            key=lambda node: (
+                node.confidence,
+                node.support,
+                node.angular_width,
+                -float((node.position - position).norm().item()),
+            ),
+            reverse=True,
+        )
+        self.graphs[env_index] = pruned_nodes[: self.max_nodes]
+
+    @th.no_grad()
+    def update(
+        self,
+        depth: th.Tensor,
+        positions: th.Tensor,
+        quaternions: th.Tensor,
+        target_direction: th.Tensor,
+        base_direction: Optional[th.Tensor] = None,
+    ) -> None:
+        batch_size = depth.shape[0]
+        self._ensure_batch_size(batch_size)
+
+        device = depth.device
+        positions = positions.to(device=device, dtype=depth.dtype)
+        quaternions = self._safe_normalize(
+            quaternions.to(device=device, dtype=depth.dtype), dim=1
+        )
+        target_direction = self._safe_normalize(
+            target_direction.to(device=device, dtype=depth.dtype), dim=1
+        )
+        if base_direction is None:
+            base_direction = target_direction
+        else:
+            base_direction = self._safe_normalize(
+                base_direction.to(device=device, dtype=depth.dtype), dim=1
+            )
+
+        candidates, metas = self._extract_candidates_batch(depth, positions, quaternions)
+        self._current_positions = positions.detach().clone()
+        self._current_quaternions = quaternions.detach().clone()
+        self._current_target_direction = target_direction.detach().clone()
+        self._current_base_direction = base_direction.detach().clone()
+        self._current_image_shape = (depth.shape[2], depth.shape[3])
+        self._current_metas = metas
+
+        for env_index in range(batch_size):
+            self._step_index[env_index] += 1
+            self._update_env_graph(
+                env_index,
+                candidates[env_index],
+                metas[env_index],
+                positions[env_index],
+                quaternions[env_index],
+            )
+
+    @th.no_grad()
+    def best_direction(self) -> Tuple[th.Tensor, th.Tensor]:
+        if (
+            self._current_positions is None
+            or self._current_quaternions is None
+            or self._current_target_direction is None
+            or self._current_base_direction is None
+        ):
+            raise RuntimeError("TopologyGuidance.best_direction() called before update().")
+
+        if self._current_image_shape is None:
+            raise RuntimeError("TopologyGuidance image shape is unavailable.")
+
+        if self._current_metas is None:
+            raise RuntimeError("TopologyGuidance extraction meta is unavailable.")
+
+        height, width = self._current_image_shape
+        device = self._current_positions.device
+        batch_size = self._current_positions.shape[0]
+        directions: List[th.Tensor] = []
+        valid_mask = th.zeros((batch_size, 1), dtype=th.bool, device=device)
+
+        for env_index in range(batch_size):
+            position = self._current_positions[env_index]
+            quaternion = self._current_quaternions[env_index]
+            target_direction = self._current_target_direction[env_index]
+            base_direction = self._current_base_direction[env_index]
+            turn_reference = self._last_selected_direction[env_index]
+            if turn_reference is None:
+                turn_reference = base_direction
+
+            front_blocked, _, _ = self._estimate_front_blocked(
+                env_index,
+                base_direction,
+                quaternion,
+                height=height,
+                width=width,
+            )
+
+            best_score = None
+            best_direction = base_direction
+
+            for node in self.graphs[env_index]:
+                predicted_vec = node.position - position
+                predicted_clearance = float(predicted_vec.norm().item())
+                if predicted_clearance <= 1e-4:
+                    continue
+
+                predicted_direction = self._safe_normalize(predicted_vec, dim=0)
+                projection = self._project_direction_to_image(
+                    predicted_direction,
+                    quaternion,
+                    height=height,
+                    width=width,
+                )
+                if projection is None:
+                    continue
+                if node.last_seen != self._step_index[env_index]:
+                    continue
+
+                anchor_alignment = float(th.dot(predicted_direction, base_direction).item())
+                allow_min_anchor = self.anchor_min_alignment
+                if front_blocked:
+                    allow_min_anchor = min(
+                        allow_min_anchor, self.front_relaxed_anchor_min_alignment
+                    )
+                if anchor_alignment < allow_min_anchor:
+                    continue
+
+                anchor_score = max(
+                    0.0,
+                    min(
+                        1.0,
+                        (anchor_alignment - allow_min_anchor)
+                        / max(1.0 - allow_min_anchor, 1e-6),
+                    ),
+                )
+
+                goal_dot = float(th.dot(predicted_direction, target_direction).item())
+                goal_alignment = max(0.0, goal_dot)
+                reverse_alignment = max(0.0, -goal_dot)
+
+                clearance_score = float(
+                    th.tanh(
+                        th.tensor(
+                            predicted_clearance / max(self.score_clearance_norm, 1e-6),
+                            device=device,
+                        )
+                    ).item()
+                )
+                width_score = min(
+                    node.angular_width / max(self.score_width_norm, 1e-6), 1.0
+                )
+
+                effective_confidence = min(node.confidence, 1.0)
+                if front_blocked and goal_dot < self.reverse_confidence_trigger_dot:
+                    effective_confidence = min(
+                        1.5, effective_confidence + self.reverse_confidence_boost
+                    )
+
+                persistence_score = min(
+                    node.support / max(self.score_support_norm, 1e-6), 1.0
+                ) * min(effective_confidence, 1.0)
+
+                turning_cost = 1.0 - float(
+                    th.dot(
+                        predicted_direction,
+                        self._safe_normalize(turn_reference, dim=0),
+                    ).item()
+                )
+                staleness_penalty = (
+                    self._step_index[env_index] - node.last_seen
+                ) / max(self.max_staleness, 1)
+
+                effective_anchor_score = anchor_score
+                escape_bonus = 0.0
+                if front_blocked:
+                    effective_anchor_score *= self.front_anchor_score_scale
+                    escape_bonus = reverse_alignment * (
+                        self.escape_reverse_weight
+                        + self.escape_clearance_weight * clearance_score
+                        + self.escape_width_weight * width_score
+                        + self.escape_confidence_weight * min(effective_confidence, 1.0)
+                    )
+
+                score = (
+                    1.55 * effective_anchor_score
+                    + 0.35 * goal_alignment
+                    + 0.40 * clearance_score
+                    + 0.20 * width_score
+                    + 0.35 * persistence_score
+                    + escape_bonus
+                    - 0.18 * turning_cost
+                    - 0.25 * staleness_penalty
+                )
+                if best_score is not None and score <= best_score:
+                    continue
+
+                stability = 0.5 * min(effective_confidence, 1.0) + 0.5 * min(
+                    node.support / max(self.score_support_norm, 1e-6), 1.0
+                )
+                blend_driver = effective_anchor_score
+                if front_blocked:
+                    blend_driver = max(blend_driver, 0.75 * reverse_alignment)
+                blend = self.min_output_blend + (
+                    self.max_output_blend - self.min_output_blend
+                ) * blend_driver * stability
+                blend = min(self.max_output_blend, max(self.min_output_blend, blend))
+                blended_direction = self._safe_normalize(
+                    (1.0 - blend) * base_direction + blend * predicted_direction,
+                    dim=0,
+                )
+                best_score = score
+                best_direction = blended_direction
+
+            if best_score is not None and best_score >= self.min_selection_score:
+                valid_mask[env_index, 0] = True
+            else:
+                best_direction = base_direction
+
+            best_direction = self._safe_normalize(best_direction, dim=0)
+            self._last_selected_direction[env_index] = best_direction.detach().clone()
+            directions.append(best_direction.detach().clone())
+
+        return th.stack(directions, dim=0), valid_mask
